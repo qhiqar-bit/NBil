@@ -1,0 +1,330 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "QuickReply"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.nabil.quickreply"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.nabil.quickreply"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="رد سريع"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".BubbleService"
+                      android:exported="true"
+                      android:label="رد سريع"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/nabil/quickreply
+          cat > app/src/main/java/com/nabil/quickreply/BubbleService.kt <<'EOF_FILE'
+          package com.nabil.quickreply
+
+          import android.accessibilityservice.AccessibilityService
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewConfiguration
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class BubbleService : AccessibilityService() {
+
+              private val message = "مرحبا معك نبيل، كيف يمكنني مساعدتك؟"
+              private val handler = Handler(Looper.getMainLooper())
+              private lateinit var wm: WindowManager
+              private var bubble: View? = null
+
+              override fun onServiceConnected() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  addBubble()
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  bubble?.let { runCatching { wm.removeView(it) } }
+                  bubble = null
+                  super.onDestroy()
+              }
+
+              private fun addBubble() {
+                  val d = resources.displayMetrics.density
+                  val size = (58 * d).toInt()
+
+                  val view = View(this).apply {
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(Color.parseColor("#5865F2"))
+                      }
+                  }
+                  val lp = WindowManager.LayoutParams(
+                      size, size,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      // NOT_FOCUSABLE: the bubble never steals focus, so the keyboard
+                      // and the chat input in the other app stay untouched.
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = (16 * d).toInt()
+                      y = (300 * d).toInt()
+                  }
+
+                  val slop = ViewConfiguration.get(this).scaledTouchSlop
+                  var startX = 0; var startY = 0
+                  var touchX = 0f; var touchY = 0f
+                  var moved = false
+
+                  view.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              startX = lp.x; startY = lp.y
+                              touchX = e.rawX; touchY = e.rawY
+                              moved = false
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (e.rawX - touchX).toInt()
+                              val dy = (e.rawY - touchY).toInt()
+                              if (Math.abs(dx) > slop || Math.abs(dy) > slop) moved = true
+                              if (moved) {
+                                  lp.x = startX + dx
+                                  lp.y = startY + dy
+                                  wm.updateViewLayout(view, lp)
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> if (!moved) sendReply()
+                      }
+                      true
+                  }
+
+                  wm.addView(view, lp)
+                  bubble = view
+              }
+
+              private fun sendReply() {
+                  val root = rootInActiveWindow ?: return
+                  val input = findInput(root) ?: return
+
+                  val args = Bundle().apply {
+                      putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, message)
+                  }
+                  if (!input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return
+
+                  // The send button appears only after text exists, so retry quickly.
+                  trySend(input, 0)
+              }
+
+              private fun trySend(input: AccessibilityNodeInfo, attempt: Int) {
+                  handler.postDelayed({
+                      val root = rootInActiveWindow
+                      val btn = root?.let { findSendButton(it) }
+                      if (btn != null && clickNode(btn)) return@postDelayed
+
+                      if (attempt >= 5) {
+                          // Last resort: ask the input field to perform its Enter/Send action.
+                          if (Build.VERSION.SDK_INT >= 30) {
+                              input.refresh()
+                              input.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                          }
+                      } else {
+                          trySend(input, attempt + 1)
+                      }
+                  }, 50)
+              }
+
+              private fun findInput(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+                  root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.let { if (it.isEditable) return it }
+                  val found = mutableListOf<AccessibilityNodeInfo>()
+                  collect(root) { it.isEditable && it.isVisibleToUser }.let { found.addAll(it) }
+                  return found.lastOrNull() // chat input sits at the bottom of the screen
+              }
+
+              private fun findSendButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+                  val words = listOf("send", "إرسال", "ارسال")
+                  return collect(root) { n ->
+                      val label = ((n.contentDescription ?: "").toString() + " " +
+                          (n.text ?: "") + " " + (n.viewIdResourceName ?: "")).lowercase()
+                      n.isVisibleToUser && words.any { label.contains(it) } && !n.isEditable
+                  }.lastOrNull()
+              }
+
+              private fun clickNode(node: AccessibilityNodeInfo): Boolean {
+                  var n: AccessibilityNodeInfo? = node
+                  while (n != null) {
+                      if (n.isClickable) return n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                      n = n.parent
+                  }
+                  return false
+              }
+
+              private fun collect(
+                  node: AccessibilityNodeInfo,
+                  out: MutableList<AccessibilityNodeInfo> = mutableListOf(),
+                  match: (AccessibilityNodeInfo) -> Boolean
+              ): List<AccessibilityNodeInfo> {
+                  if (match(node)) out.add(node)
+                  for (i in 0 until node.childCount) {
+                      node.getChild(i)?.let { collect(it, out, match) }
+                  }
+                  return out
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/nabil/quickreply
+          cat > app/src/main/java/com/nabil/quickreply/MainActivity.kt <<'EOF_FILE'
+          package com.nabil.quickreply
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+
+                  val title = TextView(this).apply {
+                      text = "رد سريع"
+                      textSize = 28f
+                      setTextColor(Color.parseColor("#1A1A1A"))
+                      gravity = Gravity.CENTER
+                  }
+                  val body = TextView(this).apply {
+                      text = "فعّل الخدمة من إعدادات الوصول، ثم ستظهر دائرة عائمة. افتح أي محادثة واضغط الدائرة لإرسال الرد فورا."
+                      textSize = 16f
+                      setTextColor(Color.parseColor("#1A1A1A"))
+                      gravity = Gravity.CENTER
+                      setPadding(0, pad, 0, pad)
+                  }
+                  val btn = Button(this).apply {
+                      text = "فتح إعدادات الوصول"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  }
+
+                  setContentView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(pad, pad, pad, pad)
+                      setBackgroundColor(Color.WHITE)
+                      addView(title); addView(body); addView(btn)
+                  })
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <resources>
+              <string name="service_desc">يعرض دائرة عائمة، وعند الضغط عليها يكتب الرد ويرسله تلقائيا في التطبيق المفتوح.</string>
+          </resources>
+          EOF_FILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault|flagReportViewIds"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          EOF_FILE
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk --title "QuickReply v${{ github.run_number }}" --notes "Download app-debug.apk"
