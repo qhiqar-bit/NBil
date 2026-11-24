@@ -51,8 +51,21 @@ jobs:
                   applicationId = "com.nabil.quickreply"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 4
+                  versionName = "4.0"
+              }
+              signingConfigs {
+                  create("fixed") {
+                      storeFile = file("debug.keystore")
+                      storePassword = "android"
+                      keyAlias = "androiddebugkey"
+                      keyPassword = "android"
+                  }
+              }
+              buildTypes {
+                  getByName("debug") {
+                      signingConfig = signingConfigs.getByName("fixed")
+                  }
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -97,8 +110,12 @@ jobs:
           package com.nabil.quickreply
 
           import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Context
           import android.graphics.Color
+          import android.graphics.Path
           import android.graphics.PixelFormat
+          import android.graphics.Rect
           import android.graphics.drawable.GradientDrawable
           import android.os.Build
           import android.os.Bundle
@@ -112,44 +129,99 @@ jobs:
           import android.view.WindowManager
           import android.view.accessibility.AccessibilityEvent
           import android.view.accessibility.AccessibilityNodeInfo
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
 
           class BubbleService : AccessibilityService() {
 
+              private enum class State { IDLE, WAIT_BUTTON, VERIFY }
+
               private val message = "مرحبا معك نبيل، كيف يمكنني مساعدتك؟"
+              private val discord = "com.discord"
+
               private val handler = Handler(Looper.getMainLooper())
               private lateinit var wm: WindowManager
               private var bubble: View? = null
 
-              private var pending = false
-              private var deadline = 0L
+              private var state = State.IDLE
+              private var startTime = 0L
+              private var attempts = 0
+              private var lastStructural = 0L
+              private var lastVia = ""
+              private var needSnapshot = true
+              private var snapshot: Set<String> = emptySet()
               private var lastInput: AccessibilityNodeInfo? = null
 
-              // Only labels that START with these count as the real send button.
+              // A label containing one of these is a candidate for the real send button.
               private val sendKeys = listOf("send", "إرسال", "ارسال")
-              // Buttons that look similar but are NOT the send button (e.g. "Send a gift").
-              private val blocked = listOf("gift", "هدية", "هديه", "nitro", "voice", "صوت", "file", "ملف", "image", "صورة")
+              // Look-alike buttons that must never be pressed (e.g. "Send a gift").
+              private val blocked = listOf(
+                  "gift", "هدية", "هديه", "nitro", "voice", "صوت", "file", "ملف", "image", "صورة",
+                  "emoji", "إيموجي", "ايموجي", "sticker", "ملصق", "gif", "attach", "upload"
+              )
+
+              // ---------------------------------------------------------------- loops
 
               private val poll = object : Runnable {
                   override fun run() {
-                      if (!pending) return
-                      if (attemptSend()) return
-                      if (SystemClock.uptimeMillis() > deadline) {
-                          fallbackEnter()
-                          pending = false
+                      if (state != State.WAIT_BUTTON) return
+                      if (tryClickSend(true)) return
+                      if (SystemClock.uptimeMillis() - startTime > 2000) {
+                          giveUp()
                           return
                       }
-                      handler.postDelayed(this, 8)
+                      handler.postDelayed(this, 3)
                   }
               }
+
+              // After tapping, make sure the text really left the box; if not, tap again.
+              private val verify = Runnable {
+                  val input = lastInput
+                  val stillThere = input != null && input.refresh() &&
+                      (input.text?.toString() ?: "").contains(message.take(15))
+                  if (!stillThere) {
+                      log("تم الإرسال ✓ (محاولة $attempts، $lastVia)")
+                      state = State.IDLE
+                  } else if (attempts < 3) {
+                      startTime = SystemClock.uptimeMillis()
+                      state = State.WAIT_BUTTON
+                      handler.post(poll)
+                  } else {
+                      log("فشل: النص بقي في الخانة بعد $attempts محاولات ($lastVia)")
+                      state = State.IDLE
+                  }
+              }
+
+              // Show the bubble only while Discord is the active app.
+              private val updateVisibility = Runnable {
+                  val pkg = rootInActiveWindow?.packageName?.toString() ?: return@Runnable
+                  if (pkg == "com.android.systemui") return@Runnable
+                  bubble?.visibility = if (pkg == discord) View.VISIBLE else View.GONE
+              }
+
+              // ------------------------------------------------------------ lifecycle
 
               override fun onServiceConnected() {
                   wm = getSystemService(WINDOW_SERVICE) as WindowManager
                   addBubble()
+                  handler.postDelayed(updateVisibility, 300)
               }
 
-              // The moment Discord redraws and shows the send button, click it.
               override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-                  if (pending) attemptSend()
+                  if (event == null) return
+                  if (state == State.WAIT_BUTTON) {
+                      tryClickSend(false) // click the send button the instant it appears
+                      return
+                  }
+                  if (state != State.IDLE) return
+                  val pkg = event.packageName?.toString()
+                  if (pkg == discord) {
+                      if (bubble?.visibility != View.VISIBLE) bubble?.visibility = View.VISIBLE
+                  } else if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                      handler.removeCallbacks(updateVisibility)
+                      handler.postDelayed(updateVisibility, 150)
+                  }
               }
 
               override fun onInterrupt() {}
@@ -157,13 +229,17 @@ jobs:
               override fun onDestroy() {
                   bubble?.let { runCatching { wm.removeView(it) } }
                   bubble = null
-                  handler.removeCallbacks(poll)
+                  handler.removeCallbacksAndMessages(null)
                   super.onDestroy()
               }
+
+              // --------------------------------------------------------------- bubble
 
               private fun addBubble() {
                   val d = resources.displayMetrics.density
                   val size = (58 * d).toInt()
+                  val screenW = resources.displayMetrics.widthPixels
+                  val screenH = resources.displayMetrics.heightPixels
 
                   val view = View(this).apply {
                       background = GradientDrawable().apply {
@@ -200,8 +276,8 @@ jobs:
                               val dy = (e.rawY - touchY).toInt()
                               if (Math.abs(dx) > slop || Math.abs(dy) > slop) moved = true
                               if (moved) {
-                                  lp.x = startX + dx
-                                  lp.y = startY + dy
+                                  lp.x = (startX + dx).coerceIn(0, screenW - size)
+                                  lp.y = (startY + dy).coerceIn(0, screenH - size)
                                   wm.updateViewLayout(view, lp)
                               }
                           }
@@ -214,32 +290,111 @@ jobs:
                   bubble = view
               }
 
+              // ----------------------------------------------------------------- send
+
               private fun sendReply() {
-                  if (pending) return
+                  val now = SystemClock.uptimeMillis()
+                  if (state != State.IDLE) {
+                      if (now - startTime < 5000) return
+                      state = State.IDLE
+                  }
                   val root = rootInActiveWindow ?: return
-                  val input = findInput(root) ?: return
+                  if (root.packageName?.toString() != discord) return // Discord only
+
+                  val input = findInput(root)
+                  if (input == null) {
+                      log("فشل: لم يتم العثور على خانة الكتابة")
+                      return
+                  }
+
+                  startTime = now
+                  attempts = 0
+                  needSnapshot = true
+                  snapshot = emptySet()
 
                   val args = Bundle().apply {
                       putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, message)
                   }
-                  if (!input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return
+                  if (!input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                      log("فشل: تعذر كتابة النص في الخانة")
+                      return
+                  }
 
                   lastInput = input
-                  pending = true
-                  deadline = SystemClock.uptimeMillis() + 1000
+                  state = State.WAIT_BUTTON
                   handler.post(poll)
               }
 
-              private fun attemptSend(): Boolean {
-                  if (!pending) return false
+              private fun tryClickSend(allowStructural: Boolean): Boolean {
+                  if (state != State.WAIT_BUTTON) return false
                   val root = rootInActiveWindow ?: return false
-                  val btn = findSendButton(root) ?: return false
-                  if (clickNode(btn)) {
-                      pending = false
-                      handler.removeCallbacks(poll)
-                      return true
+
+                  val input = lastInput
+                  val band = Rect()
+                  val bandOk = input != null && input.refresh()
+                  if (bandOk) input?.getBoundsInScreen(band)
+
+                  // 1) By label (fastest).
+                  var btn = findSendByLabel(root, if (bandOk) band else null)
+                  var via = "label"
+
+                  // 2) By position: a NEW clickable item that appeared to the right of the text box.
+                  if (btn == null && allowStructural && bandOk && input != null) {
+                      if (needSnapshot) {
+                          snapshot = composerButtons(input, band).map { sig(it) }.toSet()
+                          needSnapshot = false
+                      } else {
+                          val now = SystemClock.uptimeMillis()
+                          if (now - lastStructural >= 30) {
+                              lastStructural = now
+                              btn = pickStructural(input, band, now - startTime)
+                              via = "position"
+                          }
+                      }
                   }
-                  return false
+
+                  if (btn == null) return false
+                  issueClick(btn, via)
+                  return true
+              }
+
+              private fun issueClick(btn: AccessibilityNodeInfo, via: String) {
+                  state = State.VERIFY
+                  attempts++
+                  handler.removeCallbacks(poll)
+
+                  val r = rectOf(btn)
+                  var ok = false
+                  // Attempt 2 uses a plain accessibility click; others use a real touch tap,
+                  // which works with every kind of button (including React Native ones).
+                  if (attempts != 2) ok = tap(r.exactCenterX(), r.exactCenterY(), btn)
+                  if (!ok) clickNode(btn)
+
+                  lastVia = "$via ${SystemClock.uptimeMillis() - startTime}ms"
+                  handler.postDelayed(verify, 350)
+              }
+
+              private fun tap(x: Float, y: Float, fallback: AccessibilityNodeInfo): Boolean {
+                  val path = Path().apply { moveTo(x, y) }
+                  val stroke = GestureDescription.StrokeDescription(path, 0, 25)
+                  val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                  return dispatchGesture(gesture, object : GestureResultCallback() {
+                      override fun onCancelled(gestureDescription: GestureDescription?) {
+                          clickNode(fallback)
+                      }
+                  }, null)
+              }
+
+              private fun giveUp() {
+                  state = State.IDLE
+                  fallbackEnter()
+                  val sb = StringBuilder()
+                  val input = lastInput
+                  if (input != null && input.refresh()) {
+                      val band = rectOf(input)
+                      for (n in composerButtons(input, band)) sb.append("[").append(sig(n)).append("] ")
+                  }
+                  log("فشل: لم يظهر زر الإرسال. عناصر قرب الخانة: $sb")
               }
 
               private fun fallbackEnter() {
@@ -250,35 +405,88 @@ jobs:
                   }
               }
 
+              // ------------------------------------------------------- finding things
+
               private fun findInput(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
                   root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.let { if (it.isEditable) return it }
-                  val found = mutableListOf<AccessibilityNodeInfo>()
-                  findEditable(root, found)
-                  return found.lastOrNull() // chat input sits at the bottom of the screen
+                  return findEditableFromEnd(root)
               }
 
-              private fun findEditable(node: AccessibilityNodeInfo, out: MutableList<AccessibilityNodeInfo>) {
-                  if (!node.isVisibleToUser) return
-                  if (node.isEditable) out.add(node)
-                  for (i in 0 until node.childCount) {
-                      node.getChild(i)?.let { findEditable(it, out) }
+              // Walks from the bottom of the screen upward and stops at the first text box.
+              private fun findEditableFromEnd(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+                  if (!node.isVisibleToUser) return null
+                  if (node.isEditable) return node
+                  for (i in node.childCount - 1 downTo 0) {
+                      val child = node.getChild(i) ?: continue
+                      val hit = findEditableFromEnd(child)
+                      if (hit != null) return hit
                   }
+                  return null
               }
 
-              // Uses the system's built-in text search (one fast call) instead of walking the whole screen.
-              private fun findSendButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-                  var best: AccessibilityNodeInfo? = null
+              private fun findSendByLabel(root: AccessibilityNodeInfo, band: Rect?): AccessibilityNodeInfo? {
                   for (key in sendKeys) {
                       val list = root.findAccessibilityNodeInfosByText(key).orEmpty()
+                      var best: AccessibilityNodeInfo? = null
                       for (n in list) {
-                          val label = (n.contentDescription ?: n.text ?: "").toString().lowercase().trim()
-                          if (label.isEmpty()) continue
-                          val isSend = sendKeys.any { label.startsWith(it) } && blocked.none { label.contains(it) }
-                          if (isSend && n.isVisibleToUser) best = n
+                          val label = labelOf(n)
+                          if (label.isEmpty() || isBlocked(label)) continue
+                          if (!sendKeys.any { label.contains(it) }) continue
+                          if (!n.isVisibleToUser) continue
+                          if (band != null) {
+                              val r = rectOf(n)
+                              if (r.centerY() < band.top - band.height() || r.centerY() > band.bottom + band.height()) continue
+                          }
+                          best = n
                       }
                       if (best != null) return best
                   }
                   return null
+              }
+
+              private fun pickStructural(input: AccessibilityNodeInfo, band: Rect, elapsed: Long): AccessibilityNodeInfo? {
+                  val usable = composerButtons(input, band).filter { !isBlocked(labelOf(it)) }
+                  if (usable.isEmpty()) return null
+                  val fresh = usable.filter { sig(it) !in snapshot }
+                  val pool = when {
+                      fresh.isNotEmpty() && snapshot.isNotEmpty() -> fresh
+                      elapsed >= 350 -> usable
+                      else -> emptyList()
+                  }
+                  return pool.maxByOrNull { rectOf(it).centerX() }
+              }
+
+              // Clickable items on the same row as the text box and to its right (emoji, send, ...).
+              private fun composerButtons(input: AccessibilityNodeInfo, band: Rect): List<AccessibilityNodeInfo> {
+                  var anc: AccessibilityNodeInfo? = input.parent
+                  var level = 0
+                  while (anc != null && level < 5) {
+                      val found = ArrayList<AccessibilityNodeInfo>()
+                      val budget = intArrayOf(80)
+                      scan(anc, band, found, budget)
+                      if (found.isNotEmpty()) return found
+                      anc = anc.parent
+                      level++
+                  }
+                  return emptyList()
+              }
+
+              private fun scan(node: AccessibilityNodeInfo, band: Rect, out: MutableList<AccessibilityNodeInfo>, budget: IntArray) {
+                  if (budget[0] <= 0) return
+                  budget[0]--
+                  if (node.isClickable && node.isEnabled && node.isVisibleToUser && !node.isEditable) {
+                      val r = rectOf(node)
+                      val slack = band.height()
+                      val maxW = resources.displayMetrics.widthPixels * 0.4
+                      if (r.width() < maxW && r.centerX() > band.centerX() &&
+                          r.centerY() >= band.top - slack && r.centerY() <= band.bottom + slack
+                      ) out.add(node)
+                  }
+                  for (i in 0 until node.childCount) {
+                      val c = node.getChild(i) ?: continue
+                      scan(c, band, out, budget)
+                      if (budget[0] <= 0) return
+                  }
               }
 
               private fun clickNode(node: AccessibilityNodeInfo): Boolean {
@@ -288,6 +496,30 @@ jobs:
                       n = n.parent
                   }
                   return false
+              }
+
+              // -------------------------------------------------------------- helpers
+
+              private fun rectOf(n: AccessibilityNodeInfo): Rect {
+                  val r = Rect()
+                  n.getBoundsInScreen(r)
+                  return r
+              }
+
+              private fun labelOf(n: AccessibilityNodeInfo): String =
+                  (n.contentDescription ?: n.text ?: "").toString().lowercase().trim()
+
+              private fun isBlocked(label: String): Boolean = blocked.any { label.contains(it) }
+
+              private fun sig(n: AccessibilityNodeInfo): String {
+                  val r = rectOf(n)
+                  return "${r.left},${r.top},${r.right},${r.bottom}|${labelOf(n)}"
+              }
+
+              private fun log(text: String) {
+                  val time = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+                  getSharedPreferences("qr", Context.MODE_PRIVATE)
+                      .edit().putString("log", "$time  $text").apply()
               }
           }
           EOF_FILE
@@ -303,23 +535,28 @@ jobs:
           import android.view.Gravity
           import android.widget.Button
           import android.widget.LinearLayout
+          import android.widget.ScrollView
           import android.widget.TextView
 
           class MainActivity : Activity() {
+
+              private lateinit var logView: TextView
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   val pad = (24 * resources.displayMetrics.density).toInt()
+                  val ink = Color.parseColor("#1A1A1A")
 
                   val title = TextView(this).apply {
                       text = "رد سريع"
                       textSize = 28f
-                      setTextColor(Color.parseColor("#1A1A1A"))
+                      setTextColor(ink)
                       gravity = Gravity.CENTER
                   }
                   val body = TextView(this).apply {
-                      text = "فعّل الخدمة من إعدادات الوصول، ثم ستظهر دائرة عائمة. افتح أي محادثة واضغط الدائرة لإرسال الرد فورا."
+                      text = "فعّل الخدمة من إعدادات الوصول، ثم افتح ديسكورد وستظهر دائرة عائمة. اضغطها لإرسال الرد فورا."
                       textSize = 16f
-                      setTextColor(Color.parseColor("#1A1A1A"))
+                      setTextColor(ink)
                       gravity = Gravity.CENTER
                       setPadding(0, pad, 0, pad)
                   }
@@ -327,14 +564,36 @@ jobs:
                       text = "فتح إعدادات الوصول"
                       setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
                   }
-
-                  setContentView(LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
+                  val logTitle = TextView(this).apply {
+                      text = "آخر محاولة إرسال"
+                      textSize = 18f
+                      setTextColor(ink)
                       gravity = Gravity.CENTER
-                      setPadding(pad, pad, pad, pad)
+                      setPadding(0, pad, 0, pad / 3)
+                  }
+                  logView = TextView(this).apply {
+                      textSize = 14f
+                      setTextColor(ink)
+                      gravity = Gravity.CENTER
+                      setTextIsSelectable(true)
+                  }
+
+                  val column = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(pad, pad * 2, pad, pad)
+                      addView(title); addView(body); addView(btn); addView(logTitle); addView(logView)
+                  }
+                  setContentView(ScrollView(this).apply {
                       setBackgroundColor(Color.WHITE)
-                      addView(title); addView(body); addView(btn)
+                      addView(column)
                   })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  logView.text = getSharedPreferences("qr", MODE_PRIVATE)
+                      .getString("log", "لا توجد محاولات بعد")
               }
           }
           EOF_FILE
@@ -352,9 +611,11 @@ jobs:
               android:accessibilityFeedbackType="feedbackGeneric"
               android:accessibilityFlags="flagDefault|flagReportViewIds"
               android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
               android:description="@string/service_desc"
               android:notificationTimeout="0" />
           EOF_FILE
+          echo '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' | base64 -d > app/debug.keystore
       - name: Build
         run: gradle assembleDebug --no-daemon
       - name: Publish release
