@@ -104,6 +104,7 @@ jobs:
           import android.os.Bundle
           import android.os.Handler
           import android.os.Looper
+          import android.os.SystemClock
           import android.view.Gravity
           import android.view.MotionEvent
           import android.view.View
@@ -119,17 +120,44 @@ jobs:
               private lateinit var wm: WindowManager
               private var bubble: View? = null
 
+              private var pending = false
+              private var deadline = 0L
+              private var lastInput: AccessibilityNodeInfo? = null
+
+              // Only labels that START with these count as the real send button.
+              private val sendKeys = listOf("send", "إرسال", "ارسال")
+              // Buttons that look similar but are NOT the send button (e.g. "Send a gift").
+              private val blocked = listOf("gift", "هدية", "هديه", "nitro", "voice", "صوت", "file", "ملف", "image", "صورة")
+
+              private val poll = object : Runnable {
+                  override fun run() {
+                      if (!pending) return
+                      if (attemptSend()) return
+                      if (SystemClock.uptimeMillis() > deadline) {
+                          fallbackEnter()
+                          pending = false
+                          return
+                      }
+                      handler.postDelayed(this, 8)
+                  }
+              }
+
               override fun onServiceConnected() {
                   wm = getSystemService(WINDOW_SERVICE) as WindowManager
                   addBubble()
               }
 
-              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              // The moment Discord redraws and shows the send button, click it.
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (pending) attemptSend()
+              }
+
               override fun onInterrupt() {}
 
               override fun onDestroy() {
                   bubble?.let { runCatching { wm.removeView(it) } }
                   bubble = null
+                  handler.removeCallbacks(poll)
                   super.onDestroy()
               }
 
@@ -146,8 +174,6 @@ jobs:
                   val lp = WindowManager.LayoutParams(
                       size, size,
                       WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                      // NOT_FOCUSABLE: the bubble never steals focus, so the keyboard
-                      // and the chat input in the other app stay untouched.
                       WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                           WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                       PixelFormat.TRANSLUCENT
@@ -189,6 +215,7 @@ jobs:
               }
 
               private fun sendReply() {
+                  if (pending) return
                   val root = rootInActiveWindow ?: return
                   val input = findInput(root) ?: return
 
@@ -197,42 +224,61 @@ jobs:
                   }
                   if (!input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return
 
-                  // The send button appears only after text exists, so retry quickly.
-                  trySend(input, 0)
+                  lastInput = input
+                  pending = true
+                  deadline = SystemClock.uptimeMillis() + 1000
+                  handler.post(poll)
               }
 
-              private fun trySend(input: AccessibilityNodeInfo, attempt: Int) {
-                  handler.postDelayed({
-                      val root = rootInActiveWindow
-                      val btn = root?.let { findSendButton(it) }
-                      if (btn != null && clickNode(btn)) return@postDelayed
+              private fun attemptSend(): Boolean {
+                  if (!pending) return false
+                  val root = rootInActiveWindow ?: return false
+                  val btn = findSendButton(root) ?: return false
+                  if (clickNode(btn)) {
+                      pending = false
+                      handler.removeCallbacks(poll)
+                      return true
+                  }
+                  return false
+              }
 
-                      if (attempt >= 5) {
-                          // Last resort: ask the input field to perform its Enter/Send action.
-                          if (Build.VERSION.SDK_INT >= 30) {
-                              input.refresh()
-                              input.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
-                          }
-                      } else {
-                          trySend(input, attempt + 1)
-                      }
-                  }, 50)
+              private fun fallbackEnter() {
+                  val input = lastInput ?: return
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      input.refresh()
+                      input.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                  }
               }
 
               private fun findInput(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
                   root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.let { if (it.isEditable) return it }
                   val found = mutableListOf<AccessibilityNodeInfo>()
-                  collect(root) { it.isEditable && it.isVisibleToUser }.let { found.addAll(it) }
+                  findEditable(root, found)
                   return found.lastOrNull() // chat input sits at the bottom of the screen
               }
 
+              private fun findEditable(node: AccessibilityNodeInfo, out: MutableList<AccessibilityNodeInfo>) {
+                  if (!node.isVisibleToUser) return
+                  if (node.isEditable) out.add(node)
+                  for (i in 0 until node.childCount) {
+                      node.getChild(i)?.let { findEditable(it, out) }
+                  }
+              }
+
+              // Uses the system's built-in text search (one fast call) instead of walking the whole screen.
               private fun findSendButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-                  val words = listOf("send", "إرسال", "ارسال")
-                  return collect(root) { n ->
-                      val label = ((n.contentDescription ?: "").toString() + " " +
-                          (n.text ?: "") + " " + (n.viewIdResourceName ?: "")).lowercase()
-                      n.isVisibleToUser && words.any { label.contains(it) } && !n.isEditable
-                  }.lastOrNull()
+                  var best: AccessibilityNodeInfo? = null
+                  for (key in sendKeys) {
+                      val list = root.findAccessibilityNodeInfosByText(key).orEmpty()
+                      for (n in list) {
+                          val label = (n.contentDescription ?: n.text ?: "").toString().lowercase().trim()
+                          if (label.isEmpty()) continue
+                          val isSend = sendKeys.any { label.startsWith(it) } && blocked.none { label.contains(it) }
+                          if (isSend && n.isVisibleToUser) best = n
+                      }
+                      if (best != null) return best
+                  }
+                  return null
               }
 
               private fun clickNode(node: AccessibilityNodeInfo): Boolean {
@@ -242,18 +288,6 @@ jobs:
                       n = n.parent
                   }
                   return false
-              }
-
-              private fun collect(
-                  node: AccessibilityNodeInfo,
-                  out: MutableList<AccessibilityNodeInfo> = mutableListOf(),
-                  match: (AccessibilityNodeInfo) -> Boolean
-              ): List<AccessibilityNodeInfo> {
-                  if (match(node)) out.add(node)
-                  for (i in 0 until node.childCount) {
-                      node.getChild(i)?.let { collect(it, out, match) }
-                  }
-                  return out
               }
           }
           EOF_FILE
@@ -314,12 +348,12 @@ jobs:
           cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_FILE'
           <?xml version="1.0" encoding="utf-8"?>
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewTextChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
               android:accessibilityFlags="flagDefault|flagReportViewIds"
               android:canRetrieveWindowContent="true"
               android:description="@string/service_desc"
-              android:notificationTimeout="100" />
+              android:notificationTimeout="0" />
           EOF_FILE
       - name: Build
         run: gradle assembleDebug --no-daemon
